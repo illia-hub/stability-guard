@@ -57,6 +57,8 @@ DEFAULT_CONFIG = {
     "confirm_mode": "banner",
     "confirm_timeout_seconds": 20,
     "notify_play_sound_directly": True,
+    "critical_alert_mode": "dialog",
+    "alert_timeout_seconds": 30,
     "ai_enabled": True,
     "ai_timeout_seconds": 120,
     "claude_bin": "claude",
@@ -173,6 +175,29 @@ def notify(title, message, subtitle=None, open_path=None, key=None, sound=None,
     if sound:
         script += ' sound name "%s"' % esc(sound)
     run(["osascript", "-e", script], timeout=8)
+
+
+def alert(title, message):
+    """
+    Impossible-to-miss alert for critical events.
+
+    Banners depend on per-app notification settings and are hidden entirely
+    while the screen is shared, so they cannot be relied on. A dialog is drawn
+    by the window server itself and always shows. It closes by itself after
+    alert_timeout_seconds, so nothing ever blocks the daemon for long.
+    """
+    notify(title, message, sound=CONFIG.get("notify_sound_critical") or None)
+    if CONFIG.get("critical_alert_mode", "dialog") != "dialog":
+        return
+
+    def esc(s):
+        return s.replace("\\", "\\\\").replace('"', '\\"')[:400]
+
+    timeout = CONFIG.get("alert_timeout_seconds", 30)
+    script = ('display dialog "%s" with title "Stability Guard" buttons {"Понятно"}'
+              ' default button "Понятно" with icon caution giving up after %d'
+              % (esc(message), timeout))
+    run(["osascript", "-e", script], timeout=timeout + 10)
 
 
 def load_config():
@@ -658,9 +683,9 @@ def tick(state, throttled_pids, incident):
         incident = incident or Incident()
         incident.pressure_peak = max(incident.pressure_peak, level)
         incident.top_mem = top_memory_processes(5)
-        notify("Критическое давление на память", "; ".join(incident.top_mem[:3]),
-               subtitle="уровень 4 из 4 - сейчас будет тормозить",
-               key="pressure-critical", sound=CONFIG.get("notify_sound_critical", "Basso") or None)
+        alert("Критическое давление на память",
+              "Уровень 4 из 4 - сейчас будет тормозить.\n\nБольше всего занимают:\n"
+              + "\n".join(incident.top_mem[:5]))
         log("memory pressure critical, top: %s" % incident.top_mem)
     elif level is not None and level >= CONFIG["pressure_warn_level"]:
         # Early warning: the Mac is starting to struggle but is not critical yet.
@@ -681,7 +706,8 @@ def tick(state, throttled_pids, incident):
     if crashes:
         incident = incident or Incident()
         incident.crashes.extend(crashes)
-        notify("Системная ошибка", "Новые крэш-репорты: %s" % ", ".join(crashes[:2]), sound=CONFIG.get("notify_sound_critical", "Basso") or None)
+        alert("Системная ошибка",
+              "Появились новые крэш-репорты:\n" + "\n".join(crashes[:5]))
         log("new crash reports: %s" % crashes)
         save_state(state)
 
