@@ -437,10 +437,10 @@ def ask_permission_banner(app, cpu):
         except OSError:
             pass
         PENDING[app] = now
-        notify("Понижу приоритет через %d с" % CONFIG.get("confirm_timeout_seconds", 20),
-               "%s грузит %.0f%% CPU в фоне. Нажми это уведомление, чтобы отменить."
+        notify("Throttling in %d s" % CONFIG.get("confirm_timeout_seconds", 20),
+               "%s is using %.0f%% CPU in the background. Click this notification to cancel."
                % (app, cpu),
-               subtitle="без нажатия действие выполнится",
+               subtitle="no click means it goes ahead",
                sound=CONFIG.get("notify_sound") or None,
                key="veto-%s" % app,
                execute="/usr/bin/touch %s" % shlex_quote(marker))
@@ -457,7 +457,7 @@ def ask_permission_banner(app, cpu):
             pass
         DENIED.add(app)
         log("you vetoed %s, leaving it alone this session" % app)
-        notify("Отменено", "%s останется с обычным приоритетом." % app)
+        notify("Cancelled", "%s keeps its normal priority." % app)
         return False
 
     APPROVED.add(app)
@@ -475,7 +475,7 @@ def ask_permission(app, cpu):
     Ask before lowering an app's priority. Returns True if allowed.
 
     Answers are remembered per app until the daemon restarts, so you are asked
-    once per app, not every 15 seconds. "Никогда" writes the app into the
+    once per app, not every 15 seconds. "Never" writes the app into the
     whitelist so it survives a restart. No answer within the timeout means NO -
     the daemon never acts on silence.
     """
@@ -486,10 +486,10 @@ def ask_permission(app, cpu):
 
     timeout = CONFIG.get("confirm_timeout_seconds", 20)
     script = (
-        'display dialog "Приложение %s грузит %.0f%% CPU в фоне.\n\n'
-        'Понизить его приоритет? Вернётся, как только переключишься в него."'
-        ' with title "Stability Guard" buttons {"Никогда", "Не сейчас", "Понизить"}'
-        ' default button "Понизить" with icon caution giving up after %d'
+        'display dialog "%s is using %.0f%% CPU in the background.\n\n'
+        'Lower its priority? It is restored as soon as you switch to it."'
+        ' with title "Stability Guard" buttons {"Never", "Not now", "Lower"}'
+        ' default button "Lower" with icon caution giving up after %d'
         % (app.replace('"', ""), cpu, timeout)
     )
     ok, out = run(["osascript", "-e", script], timeout=timeout + 10)
@@ -503,13 +503,13 @@ def ask_permission(app, cpu):
         DENIED.add(app)
         return False
 
-    if "Понизить" in out:
+    if "Lower" in out:
         APPROVED.add(app)
         log("you allowed throttling of %s" % app)
         return True
 
     DENIED.add(app)
-    if "Никогда" in out:
+    if "Never" in out:
         add_to_whitelist(app)
     else:
         log("you skipped %s for this session" % app)
@@ -526,7 +526,7 @@ def add_to_whitelist(app):
             with open(CONFIG_PATH, "w") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
         log("%s added to whitelist permanently" % app)
-        notify("Добавлено в whitelist", "%s больше не будет понижаться." % app)
+        notify("Added to whitelist", "%s will never be throttled again." % app)
     except Exception as e:
         log("cannot update whitelist: %s" % e)
 
@@ -552,12 +552,12 @@ def unthrottle(pid):
 SYSTEM_PROMPT = (
     "You are the reporting module of a macOS stability daemon. "
     "You receive facts about one incident plus the last reports you already wrote. "
-    "Answer in Russian, max 6 lines, plain text, no markdown headers. "
+    "Answer in English, max 6 lines, plain text, no markdown headers. "
     "Structure: 1-2 lines what happened, then at most ONE recommendation. "
     "Hard rule: do NOT repeat a recommendation that already appears in the history "
     "unless the new data shows a clearly different pattern. If the history already "
     "covers this situation and nothing new appeared, write exactly: "
-    "'Povtor izvestnogo patterna, novyh rekomendacij net.' in Russian. "
+    "'Known pattern repeated, no new recommendations.' "
     "Never suggest killing processes, deleting files or disabling swap - the daemon "
     "is read-only by design and cannot do those things."
 )
@@ -569,10 +569,10 @@ def history_tail(n=10):
         with open(HISTORY_PATH) as f:
             text = f.read()
     except Exception:
-        return "(история пуста)"
+        return "(no history yet)"
     entries = [e for e in text.split("\n## ") if e.strip()]
     if not entries:
-        return "(история пуста)"
+        return "(no history yet)"
     return "\n## " + "\n## ".join(entries[-n:])
 
 
@@ -584,8 +584,8 @@ def ask_claude(incident_text):
         return None
 
     prompt = (
-        "ИНЦИДЕНТ:\n%s\n\n"
-        "ПРЕДЫДУЩИЕ ОТЧЁТЫ (не повторяй рекомендации отсюда):\n%s\n"
+        "INCIDENT:\n%s\n\n"
+        "PREVIOUS REPORTS (do not repeat recommendations from here):\n%s\n"
         % (incident_text, history_tail(10))
     )
     # --allowed-tools "" means Claude can only produce text: it cannot touch
@@ -602,7 +602,7 @@ def ask_claude(incident_text):
 
 def write_report(incident_text, report_text):
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    block = "\n## %s\n\n**Факты:**\n%s\n\n**Отчёт:**\n%s\n" % (
+    block = "\n## %s\n\n**Facts:**\n%s\n\n**Report:**\n%s\n" % (
         stamp, incident_text, report_text)
     try:
         with open(HISTORY_PATH, "a") as f:
@@ -636,18 +636,18 @@ class Incident:
 
     def to_text(self):
         mins = max(1, int((time.time() - self.started) / 60))
-        lines = ["Длительность: ~%d мин" % mins]
+        lines = ["Duration: ~%d min" % mins]
         if self.throttled:
             apps = ", ".join("%s (x%d)" % (a, n) for a, n in
                              sorted(self.throttled.items(), key=lambda x: -x[1]))
-            lines.append("Понижен приоритет (taskpolicy -b): " + apps)
+            lines.append("Throttled (taskpolicy -b): " + apps)
         if self.pressure_peak >= 2:
-            lines.append("Пик memory pressure: %d (1=норма, 2=warning, 4=critical)"
+            lines.append("Peak memory pressure: %d (1=normal, 2=warning, 4=critical)"
                          % self.pressure_peak)
         if self.top_mem:
-            lines.append("Топ по памяти: " + "; ".join(self.top_mem))
+            lines.append("Top memory: " + "; ".join(self.top_mem))
         if self.crashes:
-            lines.append("Системные ошибки / крэш-репорты: " + ", ".join(self.crashes[:5]))
+            lines.append("System errors / crash reports: " + ", ".join(self.crashes[:5]))
         return "\n".join("- " + l for l in lines)
 
 
@@ -665,8 +665,8 @@ def tick(state, throttled_pids, incident):
     front_changed = front != LAST_FRONT
     if front_changed:
         # Also proves the Accessibility permission is granted: without it
-        # osascript returns nothing and this line would read "(неизвестно)".
-        log("focus: %s" % (front or "(неизвестно - нет доступа к Accessibility)"))
+        # osascript returns nothing and this line would read "(unknown)".
+        log("focus: %s" % (front or "(unknown - no Accessibility permission)"))
         LAST_FRONT = front
     whitelist = set(CONFIG["whitelist"])
     procs = list_gui_processes()
@@ -734,15 +734,15 @@ def tick(state, throttled_pids, incident):
             incident = incident or Incident()
             incident.add_throttle(p["app"])
             if CONFIG.get("notify_every_throttle"):
-                notify("Понижен приоритет",
-                       "%s (%.0f%% CPU, не в фокусе)" % (p["app"], p["cpu"]), sound=CONFIG.get("notify_sound", "Submarine") or None)
+                notify("Priority lowered",
+                       "%s (%.0f%% CPU, not in focus)" % (p["app"], p["cpu"]), sound=CONFIG.get("notify_sound", "Submarine") or None)
             elif CONFIG.get("notify_before_action", True) and not incident.warned_action:
                 # One "I am acting now" notification per incident, not per app.
                 incident.warned_action = True
-                notify("Система под нагрузкой",
-                       "Понижаю приоритет фоновых приложений: %s. Вернётся при переключении в них."
+                notify("System under load",
+                       "Lowering priority of background apps: %s. Restored when you switch to them."
                        % p["app"],
-                       subtitle="%s грузит %.0f%% CPU в фоне" % (p["app"], p["cpu"]), sound=CONFIG.get("notify_sound", "Submarine") or None)
+                       subtitle="%s is using %.0f%% CPU in the background" % (p["app"], p["cpu"]), sound=CONFIG.get("notify_sound", "Submarine") or None)
 
     # 3) memory pressure
     level = memory_pressure_level()
@@ -750,8 +750,8 @@ def tick(state, throttled_pids, incident):
         incident = incident or Incident()
         incident.pressure_peak = max(incident.pressure_peak, level)
         incident.top_mem = top_memory_processes(5)
-        alert("Критическое давление на память",
-              "Уровень 4 из 4 - сейчас будет тормозить.\n\nБольше всего занимают:\n"
+        alert("Critical memory pressure",
+              "Level 4 of 4 - things are about to stall.\n\nUsing the most memory:\n"
               + "\n".join(incident.top_mem[:5]))
         log("memory pressure critical, top: %s" % incident.top_mem)
     elif level is not None and level >= CONFIG["pressure_warn_level"]:
@@ -761,9 +761,9 @@ def tick(state, throttled_pids, incident):
             if not incident.warned_lag:
                 incident.warned_lag = True
                 incident.top_mem = top_memory_processes(5)
-                notify("Память под давлением",
-                       "Больше всего занимают: " + "; ".join(incident.top_mem[:3]),
-                       subtitle="уровень %d из 4 - возможны подтормаживания" % level,
+                notify("Memory under pressure",
+                       "Using the most memory: " + "; ".join(incident.top_mem[:3]),
+                       subtitle="level %d of 4 - things may get slow" % level,
                        key="lag-warning", sound=CONFIG.get("notify_sound", "Submarine") or None)
         if incident:
             incident.pressure_peak = max(incident.pressure_peak, level)
@@ -773,8 +773,8 @@ def tick(state, throttled_pids, incident):
     if crashes:
         incident = incident or Incident()
         incident.crashes.extend(crashes)
-        alert("Системная ошибка",
-              "Появились новые крэш-репорты:\n" + "\n".join(crashes[:5]))
+        alert("System error",
+              "New crash reports appeared:\n" + "\n".join(crashes[:5]))
         log("new crash reports: %s" % crashes)
         save_state(state)
 
@@ -796,29 +796,29 @@ def finish_incident(state, incident):
     since_last = time.time() - state.get("last_report_ts", 0)
 
     if not CONFIG.get("ai_enabled", True):
-        write_report(facts, "(ИИ-отчёты отключены в конфиге)")
+        write_report(facts, "(AI reports disabled in config)")
         return
     if since_last < cooldown:
         log("report skipped: cooldown, %d min left" % int((cooldown - since_last) / 60))
-        write_report(facts, "(отчёт пропущен: cooldown подписки)")
+        write_report(facts, "(report skipped: subscription cooldown)")
         return
 
-    who = ", ".join(incident.throttled) or "давление на память"
-    notify("Спрашиваю Claude", "Инцидент закончился (%s). Запрашиваю разбор." % who,
-           subtitle="через подписку, не через API", key="asking-claude", sound=CONFIG.get("notify_sound", "Submarine") or None)
+    who = ", ".join(incident.throttled) or "memory pressure"
+    notify("Asking Claude", "Incident is over (%s). Requesting an analysis." % who,
+           subtitle="through your subscription, not the API", key="asking-claude", sound=CONFIG.get("notify_sound", "Submarine") or None)
     report = ask_claude(facts)
     if report:
         write_report(facts, report)
         state["last_report_ts"] = time.time()
         save_state(state)
-        notify("Отчёт от Claude готов", report.splitlines()[0][:180],
-               subtitle="нажми, чтобы открыть историю" if shutil.which("terminal-notifier")
-               else "история: ~/.local/share/stability-guard/history.md",
+        notify("Claude report ready", report.splitlines()[0][:180],
+               subtitle="click to open the history" if shutil.which("terminal-notifier")
+               else "history: ~/.local/share/stability-guard/history.md",
                open_path=HISTORY_PATH, sound=CONFIG.get("notify_sound", "Submarine") or None)
         log("report written")
     else:
-        write_report(facts, "(Claude недоступен, отчёт не получен)")
-        notify("Claude не ответил", "Факты инцидента всё равно записаны в историю.",
+        write_report(facts, "(Claude unavailable, no report)")
+        notify("Claude did not answer", "Incident facts were still written to the history.",
                open_path=HISTORY_PATH, sound=CONFIG.get("notify_sound", "Submarine") or None)
 
 
@@ -843,7 +843,7 @@ def main():
 
     log("stability-guard started (poll=%ss, whitelist=%s)"
         % (CONFIG["poll_seconds"], ", ".join(CONFIG["whitelist"])))
-    notify("Stability Guard", "Демон запущен. Слежу за фокусом, памятью и ошибками.")
+    notify("Stability Guard", "Daemon started. Watching focus, memory and errors.")
 
     while True:
         try:
@@ -913,29 +913,29 @@ if __name__ == "__main__":
         CONFIG = load_config()
         CONFIG["notify_dedupe_seconds"] = 0
         globals()["CONFIG"] = CONFIG
-        notify("Память под давлением", "Больше всего занимают: Docker 4100 MB; Chrome 2300 MB",
-               subtitle="уровень 2 из 4 - возможны подтормаживания",
+        notify("Memory under pressure", "Using the most memory: Docker 4100 MB; Chrome 2300 MB",
+               subtitle="level 2 of 4 - things may get slow",
                sound=CONFIG.get("notify_sound") or None)
         time.sleep(2)
-        notify("Система под нагрузкой",
-               "Понижаю приоритет фоновых приложений: Docker. Вернётся при переключении в них.",
-               subtitle="Docker грузит 42% CPU в фоне",
+        notify("System under load",
+               "Lowering priority of background apps: Docker. Restored when you switch to them.",
+               subtitle="Docker is using 42% CPU in the background",
                sound=CONFIG.get("notify_sound") or None)
         time.sleep(2)
-        notify("Критическое давление на память", "Docker 4100 MB; ollama 1900 MB",
-               subtitle="уровень 4 из 4 - сейчас будет тормозить",
+        notify("Critical memory pressure", "Docker 4100 MB; ollama 1900 MB",
+               subtitle="level 4 of 4 - things are about to stall",
                sound=CONFIG.get("notify_sound_critical") or None)
         time.sleep(2)
-        notify("Системная ошибка", "Новые крэш-репорты: Example_2026-01-01.ips",
+        notify("System error", "New crash reports: Example_2026-01-01.ips",
                sound=CONFIG.get("notify_sound_critical") or None)
         time.sleep(2)
-        notify("Спрашиваю Claude", "Инцидент закончился (Docker). Запрашиваю разбор.",
-               subtitle="через подписку, не через API",
+        notify("Asking Claude", "Incident is over (Docker). Requesting an analysis.",
+               subtitle="through your subscription, not the API",
                sound=CONFIG.get("notify_sound") or None)
         time.sleep(2)
-        notify("Отчёт от Claude готов", "Пример строки отчёта.",
-               subtitle="история: ~/.local/share/stability-guard/history.md",
+        notify("Claude report ready", "Example report line.",
+               subtitle="history: ~/.local/share/stability-guard/history.md",
                open_path=HISTORY_PATH, sound=CONFIG.get("notify_sound") or None)
-        print("Отправлено 6 уведомлений. Проверь Центр уведомлений.")
+        print("Sent 6 notifications. Check Notification Center.")
     else:
         main()
