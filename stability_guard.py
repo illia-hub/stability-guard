@@ -150,10 +150,12 @@ def notify(title, message, subtitle=None, open_path=None, key=None, sound=None,
 
     tn = shutil.which("terminal-notifier")
     if tn:
+        # No -group on purpose: terminal-notifier REMOVES the previous
+        # notification that shares a group id, so a constant group would mean
+        # only the newest event ever survives in Notification Center.
         # -ignoreDnD gets the banner through an active Focus session, which is
         # the whole point for a warning that the Mac is about to slow down.
-        cmd = [tn, "-title", title[:120], "-message", message[:400],
-               "-group", "stability-guard", "-ignoreDnD"]
+        cmd = [tn, "-title", title[:120], "-message", message[:400], "-ignoreDnD"]
         if subtitle:
             cmd += ["-subtitle", subtitle[:120]]
         if open_path:
