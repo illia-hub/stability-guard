@@ -78,7 +78,19 @@ else
     echo "    config:  created $CONFIG_DIR/config.json"
 fi
 
-# 6. plist. launchd does not inherit the shell environment, so PATH is written in.
+# 6. notification panel helper. Optional: without it the daemon falls back to
+# system notifications. Needs swiftc from the Command Line Tools.
+if command -v swiftc >/dev/null 2>&1; then
+    if swiftc -O -o "$INSTALL_DIR/sgnotify" "$SRC_DIR/sgnotify.swift" 2>/dev/null; then
+        echo "    panel:   $INSTALL_DIR/sgnotify"
+    else
+        echo "    WARNING: sgnotify did not compile, falling back to system notifications."
+    fi
+else
+    echo "    NOTE: swiftc not found, using system notifications."
+fi
+
+# 7. plist. launchd does not inherit the shell environment, so PATH is written in.
 LAUNCHD_PATH="$(dirname "$CLAUDE"):$(dirname "$PYTHON"):/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
 sed -e "s|__PYTHON__|$PYTHON|g" \
     -e "s|__SCRIPT__|$INSTALL_DIR/stability_guard.py|g" \
@@ -87,7 +99,7 @@ sed -e "s|__PYTHON__|$PYTHON|g" \
     "$SRC_DIR/$LABEL.plist" > "$PLIST"
 echo "    plist:   $PLIST"
 
-# 7. (re)load
+# 8. (re)load
 launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$UID" "$PLIST"
 echo "    loaded."

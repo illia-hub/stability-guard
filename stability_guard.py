@@ -57,10 +57,10 @@ DEFAULT_CONFIG = {
     "confirm_mode": "banner",
     "confirm_timeout_seconds": 20,
     "notify_play_sound_directly": True,
-    "visible_mode": "banner",
+    "visible_mode": "panel",
     "critical_alert_mode": "dialog",
-    "dialog_seconds": 4,
-    "alert_timeout_seconds": 30,
+    "dialog_seconds": 6,
+    "alert_timeout_seconds": 12,
     "ai_enabled": True,
     "ai_timeout_seconds": 120,
     "claude_bin": "claude",
@@ -109,6 +109,35 @@ def run(cmd, timeout=10, stdin_text=None):
 
 
 LAST_NOTIFY = {}
+
+
+PANEL_BIN = os.path.join(DATA_DIR, "sgnotify")
+
+
+def show_panel(title, message, seconds):
+    """
+    Our own banner: a small non-activating panel in the top right corner.
+
+    It cannot take keyboard focus and clicks pass through it, so it never gets
+    in the way. Unlike a real notification it is not suppressed while the screen
+    is recorded or a Focus is on. Returns False if the helper is not built.
+    """
+    if not os.path.exists(PANEL_BIN):
+        return False
+    # Stack panels so simultaneous events do not cover each other.
+    try:
+        out = subprocess.run(["pgrep", "-c", "-f", PANEL_BIN],
+                             capture_output=True, text=True, timeout=5)
+        index = min(int(out.stdout.strip() or 0), 4)
+    except Exception:
+        index = 0
+    try:
+        subprocess.Popen([PANEL_BIN, title[:120], message[:300], str(seconds), str(index)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception as e:
+        log("panel failed: %s" % e)
+        return False
 
 
 def show_dialog(title, message, timeout, blocking=False):
@@ -179,9 +208,13 @@ def notify(title, message, subtitle=None, open_path=None, key=None, sound=None,
     # while a Focus is active - the app's own settings cannot override that.
     # visible_mode "dialog" routes everything through a window instead, which
     # the window server always draws.
-    if CONFIG.get("visible_mode", "banner") == "dialog" and not no_dialog:
-        show_dialog(title, "%s\n\n%s" % (subtitle, message) if subtitle else message,
-                    CONFIG.get("dialog_seconds", 4))
+    mode = CONFIG.get("visible_mode", "panel")
+    if mode in ("panel", "dialog") and not no_dialog:
+        body = "%s\n%s" % (subtitle, message) if subtitle else message
+        secs = CONFIG.get("dialog_seconds", 6)
+        if mode == "panel" and show_panel(title, body, secs):
+            return
+        show_dialog(title, body, secs)
         return
 
     tn = shutil.which("terminal-notifier")
@@ -227,7 +260,9 @@ def alert(title, message):
     notify(title, message, sound=CONFIG.get("notify_sound_critical") or None,
            no_dialog=True)
     if CONFIG.get("critical_alert_mode", "dialog") == "dialog":
-        show_dialog(title, message, CONFIG.get("alert_timeout_seconds", 30))
+        secs = CONFIG.get("alert_timeout_seconds", 12)
+        if not show_panel(title, message, secs):
+            show_dialog(title, message, secs)
 
 
 def load_config():
