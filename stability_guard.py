@@ -61,6 +61,9 @@ DEFAULT_CONFIG = {
     "critical_alert_mode": "dialog",
     "dialog_seconds": 6,
     "alert_timeout_seconds": 12,
+    "sample_interval_seconds": 60,
+    "weekly_digest": True,
+    "digest_interval_days": 7,
     "ai_enabled": True,
     "ai_timeout_seconds": 120,
     "claude_bin": "claude",
@@ -370,8 +373,8 @@ def is_protected(app, front, whitelist):
     return False
 
 
-def top_memory_processes(n=5):
-    """Top N processes by RSS, as ['Name 1234 MB', ...]."""
+def top_memory_processes(n=5, raw=False):
+    """Top N processes by RSS. raw=True returns [(name, mb), ...] for sampling."""
     ok, out = run(["ps", "-axo", "rss=,comm="], timeout=10)
     if not ok:
         return []
@@ -385,7 +388,103 @@ def top_memory_processes(n=5):
         except ValueError:
             continue
     rows.sort(reverse=True)
+    if raw:
+        return [(name, rss // 1024) for rss, name in rows[:n]]
     return ["%s %d MB" % (name, rss // 1024) for rss, name in rows[:n]]
+
+
+SAMPLES_PATH = os.path.join(DATA_DIR, "samples.csv")
+
+
+def sample_memory(top_n=8):
+    """
+    Append one row per top process to samples.csv: epoch,name,rss_mb.
+
+    A single snapshot cannot tell a leak from a dev server that spikes while
+    compiling and drops back. Only a time series can, so we keep one.
+    """
+    rows = top_memory_processes(top_n, raw=True)
+    if not rows:
+        return
+    now = int(time.time())
+    try:
+        with open(SAMPLES_PATH, "a") as f:
+            for name, mb in rows:
+                f.write("%d,%s,%d\n" % (now, name.replace(",", " "), mb))
+    except Exception as e:
+        log("cannot write samples: %s" % e)
+
+
+def prune_samples(keep_days=7):
+    """Drop samples older than keep_days. Called on daemon start."""
+    cutoff = time.time() - keep_days * 86400
+    try:
+        if not os.path.exists(SAMPLES_PATH):
+            return
+        with open(SAMPLES_PATH) as f:
+            lines = [l for l in f
+                     if l.split(",", 1)[0].isdigit() and int(l.split(",", 1)[0]) >= cutoff]
+        with open(SAMPLES_PATH, "w") as f:
+            f.writelines(lines)
+    except Exception as e:
+        log("cannot prune samples: %s" % e)
+
+
+def memory_trends(hours=24, min_peak_mb=300, min_samples=6):
+    """
+    Classify each process by how its memory behaves over time.
+
+    The key signal is the FLOOR, not the peak: a leak never gives memory back,
+    so its minimum keeps rising. A build server spikes and returns, so its
+    minimum stays flat no matter how high the peaks are. Without this, two
+    snapshots of a spiky process look exactly like a leak.
+    """
+    cutoff = time.time() - hours * 3600
+    series = {}
+    try:
+        with open(SAMPLES_PATH) as f:
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) != 3 or not parts[0].isdigit():
+                    continue
+                ts = int(parts[0])
+                if ts < cutoff:
+                    continue
+                try:
+                    series.setdefault(parts[1], []).append((ts, int(parts[2])))
+                except ValueError:
+                    continue
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        log("cannot read samples: %s" % e)
+        return []
+
+    out = []
+    for name, points in series.items():
+        if len(points) < min_samples:
+            continue
+        points.sort()
+        values = [v for _, v in points]
+        peak = max(values)
+        if peak < min_peak_mb:
+            continue
+        half = len(points) // 2
+        floor_before = min(v for _, v in points[:half])
+        floor_after = min(v for _, v in points[half:])
+        latest = values[-1]
+
+        # A rising floor is what actually distinguishes a leak.
+        if floor_after > floor_before * 1.5 + 50:
+            verdict = "floor rising %d->%d MB, looks like a leak" % (floor_before, floor_after)
+        elif peak > max(floor_after, 1) * 3:
+            verdict = "spiky: floor %d MB, peak %d MB - load, not a leak" % (floor_after, peak)
+        else:
+            verdict = "steady around %d MB" % floor_after
+        out.append((peak, "%s: %s, now %d MB" % (name, verdict, latest)))
+
+    out.sort(reverse=True)
+    return [line for _, line in out[:5]]
 
 
 def new_crash_reports(seen):
@@ -554,6 +653,9 @@ SYSTEM_PROMPT = (
     "You receive facts about one incident plus the last reports you already wrote. "
     "Answer in English, max 6 lines, plain text, no markdown headers. "
     "Structure: 1-2 lines what happened, then at most ONE recommendation. "
+    "The facts may include a 24h memory trend section. Any statement about growth "
+    "or a leak MUST come from those trend lines only - never infer a trend from "
+    "the single top-memory snapshot, which is one moment in time. "
     "Hard rule: do NOT repeat a recommendation that already appears in the history "
     "unless the new data shows a clearly different pattern. If the history already "
     "covers this situation and nothing new appeared, write exactly: "
@@ -623,6 +725,7 @@ class Incident:
         self.throttled = {}      # app -> number of times throttled
         self.pressure_peak = 1
         self.crashes = []
+        self.jetsam = []
         self.top_mem = []
         # One notification per incident, not per tick and not per app.
         self.warned_lag = False
@@ -646,8 +749,15 @@ class Incident:
                          % self.pressure_peak)
         if self.top_mem:
             lines.append("Top memory: " + "; ".join(self.top_mem))
-        if self.crashes:
-            lines.append("System errors / crash reports: " + ", ".join(self.crashes[:5]))
+        if self.jetsam:
+            lines.append("OUT OF MEMORY - macOS killed a process: " + ", ".join(self.jetsam[:3]))
+        others = [c for c in self.crashes if not c.startswith("JetsamEvent")]
+        if others:
+            lines.append("System errors / crash reports: " + ", ".join(others[:5]))
+        trends = memory_trends()
+        if trends:
+            lines.append("Memory over the last 24h (floor = what is never released):")
+            lines.extend("  " + t for t in trends)
         return "\n".join("- " + l for l in lines)
 
 
@@ -656,6 +766,7 @@ class Incident:
 CONFIG = dict(DEFAULT_CONFIG)
 LAST_FRONT = None
 RECOVERED = False
+LAST_SAMPLE = 0
 
 
 def tick(state, throttled_pids, incident):
@@ -744,7 +855,12 @@ def tick(state, throttled_pids, incident):
                        % p["app"],
                        subtitle="%s is using %.0f%% CPU in the background" % (p["app"], p["cpu"]), sound=CONFIG.get("notify_sound", "Submarine") or None)
 
-    # 3) memory pressure
+    # 3) memory sample for the trend history, and memory pressure
+    global LAST_SAMPLE
+    if time.time() - LAST_SAMPLE >= CONFIG.get("sample_interval_seconds", 60):
+        LAST_SAMPLE = time.time()
+        sample_memory()
+
     level = memory_pressure_level()
     if level is not None and level >= CONFIG["pressure_critical_level"]:
         incident = incident or Incident()
@@ -773,8 +889,17 @@ def tick(state, throttled_pids, incident):
     if crashes:
         incident = incident or Incident()
         incident.crashes.extend(crashes)
-        alert("System error",
-              "New crash reports appeared:\n" + "\n".join(crashes[:5]))
+        # A JetsamEvent means macOS ran out of memory and killed something.
+        # That is a different class of problem from an app crashing on a bug.
+        jetsam = [c for c in crashes if c.startswith("JetsamEvent")]
+        if jetsam:
+            incident.jetsam.extend(jetsam)
+            alert("macOS killed a process to free memory",
+                  "Out of memory. Using the most memory right now:\n"
+                  + "\n".join(top_memory_processes(5)))
+        others = [c for c in crashes if not c.startswith("JetsamEvent")]
+        if others:
+            alert("System error", "New crash reports appeared:\n" + "\n".join(others[:5]))
         log("new crash reports: %s" % crashes)
         save_state(state)
 
@@ -822,6 +947,52 @@ def finish_incident(state, incident):
                open_path=HISTORY_PATH, sound=CONFIG.get("notify_sound", "Submarine") or None)
 
 
+DIGEST_PROMPT = (
+    "You are reviewing a week of stability reports from a macOS daemon. "
+    "Answer in English, max 10 lines, plain text. "
+    "Say which apps caused trouble most often, whether earlier recommendations "
+    "were followed by any measurable change, and name at most two things worth "
+    "doing next. Ignore one-off spikes; only call out repeating patterns."
+)
+
+
+def weekly_digest(state, force=False):
+    """One Claude call per week over the whole history, appended as a summary."""
+    if not CONFIG.get("weekly_digest", True) or not CONFIG.get("ai_enabled", True):
+        return
+    every = CONFIG.get("digest_interval_days", 7) * 86400
+    if not force and time.time() - state.get("last_digest_ts", 0) < every:
+        return
+    try:
+        with open(HISTORY_PATH) as f:
+            history = f.read()
+    except Exception:
+        return
+    if len(history) < 500:
+        return
+
+    binary = shutil.which(CONFIG.get("claude_bin", "claude"))
+    if not binary:
+        return
+    log("running weekly digest")
+    ok, out = run([binary, "-p", "--allowed-tools", "",
+                   "--append-system-prompt", DIGEST_PROMPT],
+                  timeout=CONFIG.get("ai_timeout_seconds", 120),
+                  stdin_text="HISTORY:\n" + history[-20000:])
+    state["last_digest_ts"] = time.time()
+    save_state(state)
+    if ok and out.strip():
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        try:
+            with open(HISTORY_PATH, "a") as f:
+                f.write("\n## %s - WEEKLY DIGEST\n\n%s\n" % (stamp, out.strip()))
+        except Exception as e:
+            log("cannot write digest: %s" % e)
+        notify("Weekly digest ready", out.strip().splitlines()[0][:180],
+               open_path=HISTORY_PATH, sound=CONFIG.get("notify_sound") or None)
+        log("weekly digest written")
+
+
 def main():
     global CONFIG
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -841,6 +1012,7 @@ def main():
     incident = None
     config_mtime = 0
 
+    prune_samples()
     log("stability-guard started (poll=%ss, whitelist=%s)"
         % (CONFIG["poll_seconds"], ", ".join(CONFIG["whitelist"])))
     notify("Stability Guard", "Daemon started. Watching focus, memory and errors.")
@@ -858,6 +1030,7 @@ def main():
                 pass
 
             incident = tick(state, throttled_pids, incident)
+            weekly_digest(state)
         except Exception as e:
             # A bug in one tick must never take the daemon down.
             log("tick error: %s" % e)
@@ -900,6 +1073,21 @@ def selfcheck():
     assert not [a for a in seen_apps if "Helper" in a], \
         "helper bundles not folded into their parent app: %s" % seen_apps
 
+    # Trend classification: a leak raises the floor, a build server does not.
+    import tempfile
+    global SAMPLES_PATH
+    real_samples = SAMPLES_PATH
+    SAMPLES_PATH = os.path.join(tempfile.mkdtemp(), "samples.csv")
+    now_ts = int(time.time())
+    with open(SAMPLES_PATH, "w") as f:
+        for i in range(20):
+            f.write("%d,leakdemo,%d\n" % (now_ts - (20 - i) * 300, 200 + i * 60))
+            f.write("%d,burstdemo,%d\n" % (now_ts - (20 - i) * 300, 1400 if i % 3 == 0 else 50))
+    trends = " ".join(memory_trends())
+    SAMPLES_PATH = real_samples
+    assert "floor rising" in trends.split("leakdemo")[1][:60], trends
+    assert "not a leak" in trends.split("burstdemo")[1][:80], trends
+
     print("selfcheck OK (pressure=%s, gui procs=%d, known crashes=%d)"
           % (memory_pressure_level(), len(list_gui_processes()), len(seen)))
 
@@ -907,6 +1095,17 @@ def selfcheck():
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--selfcheck":
         selfcheck()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--digest":
+        CONFIG = load_config()
+        globals()["CONFIG"] = CONFIG
+        st = load_state()
+        weekly_digest(st, force=True)
+        print("digest done, see " + HISTORY_PATH)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--trends":
+        CONFIG = load_config()
+        globals()["CONFIG"] = CONFIG
+        lines = memory_trends()
+        print("\n".join(lines) if lines else "not enough samples yet")
     elif len(sys.argv) > 1 and sys.argv[1] == "--test-notify":
         # Sends one of every notification the daemon can produce, so you can
         # check that they actually reach Notification Center.
