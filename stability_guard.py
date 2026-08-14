@@ -57,7 +57,9 @@ DEFAULT_CONFIG = {
     "confirm_mode": "banner",
     "confirm_timeout_seconds": 20,
     "notify_play_sound_directly": True,
+    "visible_mode": "banner",
     "critical_alert_mode": "dialog",
+    "dialog_seconds": 4,
     "alert_timeout_seconds": 30,
     "ai_enabled": True,
     "ai_timeout_seconds": 120,
@@ -109,8 +111,33 @@ def run(cmd, timeout=10, stdin_text=None):
 LAST_NOTIFY = {}
 
 
+def show_dialog(title, message, timeout, blocking=False):
+    """
+    A window drawn by the window server, so macOS never suppresses it - unlike
+    banners, which are hidden while the screen is recorded or a Focus is on.
+
+    By default it behaves like a banner: appears, waits `timeout` seconds, then
+    closes itself. Nothing to click, and the daemon is not blocked while it is
+    up, because the process is fired and forgotten.
+    """
+    def esc(s):
+        return s.replace("\\", "\\\\").replace('"', '\\"')[:400]
+
+    script = ('display dialog "%s" with title "%s" buttons {"OK"}'
+              ' default button "OK" with icon note giving up after %d'
+              % (esc(message), esc(title), timeout))
+    if blocking:
+        run(["osascript", "-e", script], timeout=timeout + 10)
+        return
+    try:
+        subprocess.Popen(["osascript", "-e", script],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        log("dialog failed: %s" % e)
+
+
 def notify(title, message, subtitle=None, open_path=None, key=None, sound=None,
-           execute=None):
+           execute=None, no_dialog=False):
     """
     macOS notification. Best effort - a failure here must not stop the daemon.
 
@@ -147,6 +174,15 @@ def notify(title, message, subtitle=None, open_path=None, key=None, sound=None,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception as e:
                 log("afplay failed: %s" % e)
+
+    # macOS hides banners entirely while the screen is being recorded/shared or
+    # while a Focus is active - the app's own settings cannot override that.
+    # visible_mode "dialog" routes everything through a window instead, which
+    # the window server always draws.
+    if CONFIG.get("visible_mode", "banner") == "dialog" and not no_dialog:
+        show_dialog(title, "%s\n\n%s" % (subtitle, message) if subtitle else message,
+                    CONFIG.get("dialog_seconds", 4))
+        return
 
     tn = shutil.which("terminal-notifier")
     if tn:
@@ -188,18 +224,10 @@ def alert(title, message):
     by the window server itself and always shows. It closes by itself after
     alert_timeout_seconds, so nothing ever blocks the daemon for long.
     """
-    notify(title, message, sound=CONFIG.get("notify_sound_critical") or None)
-    if CONFIG.get("critical_alert_mode", "dialog") != "dialog":
-        return
-
-    def esc(s):
-        return s.replace("\\", "\\\\").replace('"', '\\"')[:400]
-
-    timeout = CONFIG.get("alert_timeout_seconds", 30)
-    script = ('display dialog "%s" with title "Stability Guard" buttons {"Понятно"}'
-              ' default button "Понятно" with icon caution giving up after %d'
-              % (esc(message), timeout))
-    run(["osascript", "-e", script], timeout=timeout + 10)
+    notify(title, message, sound=CONFIG.get("notify_sound_critical") or None,
+           no_dialog=True)
+    if CONFIG.get("critical_alert_mode", "dialog") == "dialog":
+        show_dialog(title, message, CONFIG.get("alert_timeout_seconds", 30))
 
 
 def load_config():
