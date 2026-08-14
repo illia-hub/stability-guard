@@ -54,7 +54,7 @@ DEFAULT_CONFIG = {
     "notify_sound": "Submarine",
     "notify_sound_critical": "Basso",
     "confirm_before_throttle": False,
-    "confirm_mode": "banner",
+    "confirm_mode": "dialog",
     "confirm_timeout_seconds": 20,
     "notify_play_sound_directly": True,
     "visible_mode": "panel",
@@ -717,10 +717,12 @@ def tick(state, throttled_pids, incident):
         if p["cpu"] < CONFIG["min_cpu_percent"]:
             continue
         if CONFIG.get("confirm_before_throttle"):
-            # "banner": slides in from the top right, click to cancel (default).
-            # "dialog": modal window in the centre, nothing happens without a
-            # explicit click. Stricter, but it interrupts you.
-            if CONFIG.get("confirm_mode", "banner") == "dialog":
+            # A confirmation needs a click, so it is the one and only thing that
+            # opens a window in the centre of the screen. Every other message
+            # goes to the panel in the top right corner.
+            # "banner" mode asks by click on a system notification instead, and
+            # therefore only works with visible_mode "banner".
+            if CONFIG.get("confirm_mode", "dialog") == "dialog":
                 allowed = ask_permission(p["app"], p["cpu"])
             else:
                 allowed = ask_permission_banner(p["app"], p["cpu"])
