@@ -1,0 +1,6 @@
+# Python
+__pycache__/
+*.pyc
+
+# Tooling session state, not part of the project
+.omc/
