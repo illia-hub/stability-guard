@@ -374,23 +374,50 @@ def is_protected(app, front, whitelist):
 
 
 def top_memory_processes(n=5, raw=False):
-    """Top N processes by RSS. raw=True returns [(name, mb), ...] for sampling."""
-    ok, out = run(["ps", "-axo", "rss=,comm="], timeout=10)
+    """
+    Top N by phys_footprint - the number Activity Monitor's "Memory" column shows.
+    raw=True returns [(name, mb, pid), ...] for sampling.
+
+    RSS is NOT that number and cannot be corrected into it. macOS compresses idle
+    pages out of the resident set while they still count as footprint, and RSS
+    counts shared/file-backed pages that never do. Measured here: a VM at RSS
+    22 MB / footprint 2216 MB, chrome-headless-shell at RSS 79 MB / footprint
+    16 MB - wrong in both directions at once, so the two top-8 lists had zero
+    processes in common. /usr/bin/top is setuid root and is the only unprivileged
+    way to read footprint for every process; `footprint --all` refuses without root.
+    """
+    ok, out = run(["/usr/bin/top", "-l", "1", "-o", "mem", "-n", str(n),
+                   "-stats", "pid,command,mem"], timeout=20)
     if not ok:
         return []
-    rows = []
+    # top truncates COMMAND to 16 chars and shows the self-assigned process name
+    # (the claude CLI reports its version string), so take real names from ps.
+    names = {}
+    ok2, pout = run(["ps", "-axo", "pid=,comm="], timeout=10)
+    if ok2:
+        for line in pout.splitlines():
+            p = line.split(None, 1)
+            if len(p) == 2:
+                names[p[0]] = os.path.basename(p[1])
+    unit = {"B": 1.0 / 1048576, "K": 1.0 / 1024, "M": 1.0, "G": 1024.0}
+    rows, body = [], False
     for line in out.splitlines():
-        parts = line.strip().split(None, 1)
-        if len(parts) != 2:
+        if not body:
+            body = line.startswith("PID")   # header length is not stable, scan for it
             continue
-        try:
-            rows.append((int(parts[0]), os.path.basename(parts[1])))
-        except ValueError:
+        parts = line.split()
+        if len(parts) < 3 or not parts[0].isdigit():
             continue
-    rows.sort(reverse=True)
+        # MEM carries a unit suffix, and a +/- growth marker when -l is above 1.
+        m = re.match(r"^([\d.]+)([BKMG])[+-]?$", parts[-1])
+        if not m:
+            continue
+        mb = int(float(m.group(1)) * unit[m.group(2)])
+        # Fall back to top's truncated name if the process died between the calls.
+        rows.append((names.get(parts[0]) or " ".join(parts[1:-1]), mb, int(parts[0])))
     if raw:
-        return [(name, rss // 1024) for rss, name in rows[:n]]
-    return ["%s %d MB" % (name, rss // 1024) for rss, name in rows[:n]]
+        return rows                         # top -o mem already sorts descending
+    return ["%s %d MB" % (name, mb) for name, mb, _ in rows]
 
 
 SAMPLES_PATH = os.path.join(DATA_DIR, "samples.csv")
@@ -409,8 +436,8 @@ def sample_memory(top_n=8):
     now = int(time.time())
     try:
         with open(SAMPLES_PATH, "a") as f:
-            for name, mb in rows:
-                f.write("%d,%s,%d\n" % (now, name.replace(",", " "), mb))
+            for name, mb, pid in rows:
+                f.write("%d,%s,%d,%d\n" % (now, name.replace(",", " "), mb, pid))
     except Exception as e:
         log("cannot write samples: %s" % e)
 
@@ -440,18 +467,24 @@ def memory_trends(hours=24, min_peak_mb=300, min_samples=6):
     snapshots of a spiky process look exactly like a leak.
     """
     cutoff = time.time() - hours * 3600
-    series = {}
+    # Several processes share one name (4 x claude, 9 x renderer). Keying by name
+    # alone made floor/peak span unrelated processes, so sum siblings per tick:
+    # one number per app, which is what "how much is it using" actually means.
+    # Legacy 3-column rows are RSS, a different unit - skipping them keeps the
+    # two metrics from being compared. They age out via prune_samples.
+    totals = {}
     try:
         with open(SAMPLES_PATH) as f:
             for line in f:
                 parts = line.strip().split(",")
-                if len(parts) != 3 or not parts[0].isdigit():
+                if len(parts) != 4 or not parts[0].isdigit():
                     continue
                 ts = int(parts[0])
                 if ts < cutoff:
                     continue
                 try:
-                    series.setdefault(parts[1], []).append((ts, int(parts[2])))
+                    key = (parts[1], ts)
+                    totals[key] = totals.get(key, 0) + int(parts[2])
                 except ValueError:
                     continue
     except FileNotFoundError:
@@ -459,6 +492,10 @@ def memory_trends(hours=24, min_peak_mb=300, min_samples=6):
     except Exception as e:
         log("cannot read samples: %s" % e)
         return []
+
+    series = {}
+    for (name, ts), mb in totals.items():
+        series.setdefault(name, []).append((ts, mb))
 
     out = []
     for name, points in series.items():
@@ -474,17 +511,35 @@ def memory_trends(hours=24, min_peak_mb=300, min_samples=6):
         floor_after = min(v for _, v in points[half:])
         latest = values[-1]
 
-        # A rising floor is what actually distinguishes a leak.
-        if floor_after > floor_before * 1.5 + 50:
-            verdict = "floor rising %d->%d MB, looks like a leak" % (floor_before, floor_after)
+        # A rising floor is what actually distinguishes a leak. The ratio arm alone
+        # scales with process size, so a 4 GB process had to reach 6 GB to register -
+        # backwards for a memory daemon, where absolute bytes are what exhaust RAM.
+        # ponytail: 500 MB is calibrated for 16 GB; raise it on a bigger machine.
+        span_h = (points[-1][0] - points[0][0]) / 3600.0
+        rising = (floor_after > floor_before * 1.5 + 50
+                  or floor_after - floor_before > 500)
+        leak = 0
+        if rising and span_h >= 4:
+            # Rank on this: a climbing floor is the only actionable line here, and
+            # sorting by peak buried it under spiky giants that are just load.
+            leak = floor_after - floor_before
+            verdict = "floor rose %d->%d MB, not released" % (floor_before, floor_after)
+        elif rising:
+            verdict = "floor rose %d->%d MB but only %.1fh of data - too early to tell" % (
+                floor_before, floor_after, span_h)
         elif peak > max(floor_after, 1) * 3:
             verdict = "spiky: floor %d MB, peak %d MB - load, not a leak" % (floor_after, peak)
         else:
             verdict = "steady around %d MB" % floor_after
-        out.append((peak, "%s: %s, now %d MB" % (name, verdict, latest)))
+        # Say how old the last sample is: a sparsely covered process can be hours
+        # stale, and "now" asserted a freshness the data did not have.
+        age_h = (time.time() - points[-1][0]) / 3600.0
+        when = "now" if age_h < 0.5 else "%.0fh ago" % age_h
+        out.append((leak, peak, "%s: %s; %d MB %s; %d samples over %.1fh" % (
+            name, verdict, latest, when, len(points), span_h)))
 
     out.sort(reverse=True)
-    return [line for _, line in out[:5]]
+    return [line for _, _, line in out[:5]]
 
 
 def new_crash_reports(seen):
@@ -644,7 +699,7 @@ def unthrottle(pid):
     """Restore normal scheduling priority. No-op if the process is already gone."""
     try:
         os.kill(pid, 0)
-    except OSError:
+    except ProcessLookupError:
         return True
     ok, _ = run(["taskpolicy", "-B", "-p", str(pid)], timeout=5)
     return ok
@@ -1046,7 +1101,7 @@ def selfcheck():
     """Minimal runnable check: sensors answer, incident text is built correctly."""
     assert memory_pressure_level() in (1, 2, 4), "sysctl pressure level unreadable"
     assert isinstance(list_gui_processes(), list)
-    assert len(top_memory_processes(5)) > 0, "ps returned nothing"
+    assert len(top_memory_processes(5)) > 0, "top returned nothing"
 
     inc = Incident()
     assert inc.empty()
@@ -1084,13 +1139,22 @@ def selfcheck():
     SAMPLES_PATH = os.path.join(tempfile.mkdtemp(), "samples.csv")
     now_ts = int(time.time())
     with open(SAMPLES_PATH, "w") as f:
+        # 30 min apart: a leak verdict needs at least 4h of span, so 20 samples
+        # 5 min apart (the old fixture) would now correctly read as too early.
         for i in range(20):
-            f.write("%d,leakdemo,%d\n" % (now_ts - (20 - i) * 300, 200 + i * 60))
-            f.write("%d,burstdemo,%d\n" % (now_ts - (20 - i) * 300, 1400 if i % 3 == 0 else 50))
+            f.write("%d,leakdemo,%d,101\n" % (now_ts - (20 - i) * 1800, 200 + i * 60))
+            f.write("%d,burstdemo,%d,102\n" % (now_ts - (20 - i) * 1800,
+                                               1400 if i % 3 == 0 else 50))
+        # Two processes sharing a name must be summed per tick, not treated as
+        # one wildly swinging series.
+        for i in range(20):
+            f.write("%d,twindemo,300,201\n" % (now_ts - (20 - i) * 1800))
+            f.write("%d,twindemo,300,202\n" % (now_ts - (20 - i) * 1800))
     trends = " ".join(memory_trends())
     SAMPLES_PATH = real_samples
-    assert "floor rising" in trends.split("leakdemo")[1][:60], trends
+    assert "floor rose" in trends.split("leakdemo")[1][:60], trends
     assert "not a leak" in trends.split("burstdemo")[1][:80], trends
+    assert "600 MB" in trends.split("twindemo")[1][:60], "siblings not summed: %s" % trends
 
     print("selfcheck OK (pressure=%s, gui procs=%d, known crashes=%d)"
           % (memory_pressure_level(), len(list_gui_processes()), len(seen)))
