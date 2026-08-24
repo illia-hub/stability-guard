@@ -641,7 +641,11 @@ def throttle(pid, app):
 
 
 def unthrottle(pid):
-    """Restore normal scheduling priority."""
+    """Restore normal scheduling priority. No-op if the process is already gone."""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return True
     ok, _ = run(["taskpolicy", "-B", "-p", str(pid)], timeout=5)
     return ok
 
